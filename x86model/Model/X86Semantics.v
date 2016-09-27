@@ -11,7 +11,6 @@
 
 Require Import Coq.Strings.String.
 Require Import Coq.Program.Program.
-
 Require Import Parser.
 Require Decode.
 Require Import X86Model.Monad.

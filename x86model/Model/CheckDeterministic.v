@@ -43,9 +43,6 @@ Require Import Eqdep.
 Unset Automatic Introduction.
 Set Implicit Arguments.
 Open Scope char_scope.
-Require ExtrOcamlString.
-Require ExtrOcamlNatBigInt.
-Require ExtrOcamlNatInt.
 Import ParserArg.X86_PARSER_ARG.
 (*Import X86_BASE_PARSER.*)
 Open Scope list_scope.

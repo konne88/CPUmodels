@@ -26,9 +26,6 @@ Open Scope char_scope.
 Local Open Scope Z_scope.
 
 
-Require ExtrOcamlString.
-Require ExtrOcamlNatBigInt.
-(*Require ExtrOcamlNatInt.*)
 
 
 Section Grammar1.
