@@ -356,7 +356,13 @@ Module RTL(M : MACHINE_SIG).
 
   Local Open Scope monad_scope.
 
-  Fixpoint interp_rtl_exp s (e:rtl_exp s) (rs:rtl_state) : int s := 
+  Definition cast_signed {s s'} (v:int s) : int s' :=
+    Word.repr (Word.signed v).
+  
+  Definition cast_unsigned {s s'} (v:int s) : int s' :=
+    Word.repr (Word.unsigned v).
+
+  Fixpoint interp_rtl_exp s (e:rtl_exp s) (rs:rtl_state) : int s :=
     match e with 
       | arith_rtl_exp b e1 e2 =>
         let v1 := interp_rtl_exp e1 rs in 
@@ -369,9 +375,9 @@ Module RTL(M : MACHINE_SIG).
         if (Word.eq v Word.one) then interp_rtl_exp e1 rs
         else interp_rtl_exp e2 rs
       | cast_s_rtl_exp _ e =>
-        let v := interp_rtl_exp e rs in Word.repr (Word.signed v)
+        let v := interp_rtl_exp e rs in cast_signed v
       | cast_u_rtl_exp _ e => 
-        let v := interp_rtl_exp e rs in Word.repr (Word.unsigned v)
+        let v := interp_rtl_exp e rs in cast_unsigned v
       | imm_rtl_exp v => v
       | get_loc_rtl_exp l => M.get_location l (rtl_mach_state rs)
       | get_array_rtl_exp a e => 
