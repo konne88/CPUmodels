@@ -2458,14 +2458,15 @@ Definition conv_POPF pre :=
                        | true => @Word.repr s (BinInt.Z_of_nat (s-n)) 
                        | false => @Word.repr s (BinInt.Z_of_nat n) 
                      end) in
-    match n with
-      | O => load_int curr_int
-      | S n' => bcount <- load_int curr_int;
-        rec0 <- conv_BS_aux d n' op;
-        ps <- arith shru_op op bcount;
-        curr_bit <- cast_u size1 ps;
-        rec1 <- load_int curr_int;
-        if_exp curr_bit rec1 rec0
+    fun st => match n with
+      | O => load_int curr_int st
+      | S n' =>
+        let bcount := fst (load_int curr_int st) in
+        let ps := fst (arith shru_op op bcount st) in
+        let curr_bit := fst (cast_u size1 ps st) in
+        let rec1 := fst (load_int curr_int st) in
+        let rec0 := fst (conv_BS_aux d n' op st) in
+          if_exp curr_bit rec1 rec0 st
     end.
 
   Definition conv_BS (d: bool) (pre: prefix) (op1 op2: operand) :=
