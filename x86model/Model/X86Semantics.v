@@ -509,7 +509,9 @@ Module X86_Compile.
   Import X86_RTL.
   Local Open Scope monad_scope.
 
-  Record conv_state := { c_rev_i :list rtl_instr }.
+  (** c_rev_i is the list of rtl instructions generated in reverse;
+      c_next is the index of the next pseudo reg. *)
+  Record conv_state := { c_rev_i : list rtl_instr ; c_next : Z }.
   Definition Conv(T:Type) := conv_state -> T * conv_state.
   Instance Conv_monad : Monad Conv := {
     Return := fun A (x:A) (s:conv_state) => (x,s) ; 
@@ -520,12 +522,12 @@ Module X86_Compile.
   intros ; apply Coqlib.extensionality ; intros. destruct (c x). auto.
   intros ; apply Coqlib.extensionality ; intros. destruct (f x) ; auto. 
   Defined.
-  Definition runConv (c:Conv unit) : (list rtl_instr) := 
-    match c {|c_rev_i := nil |} with 
+  Definition runConv (c:Conv unit) : (list rtl_instr) :=
+    match c {|c_rev_i := nil ; c_next:=0|} with
       | (_, c') => (List.rev (c_rev_i c'))
     end.
-  Definition EMIT(i:rtl_instr) : Conv unit := 
-    fun s => (tt,{|c_rev_i := i::(c_rev_i s) |}).
+  Definition EMIT(i:rtl_instr) : Conv unit :=
+    fun s => (tt,{|c_rev_i := i::(c_rev_i s) ; c_next := c_next s|}).
   Notation "'emit' i" := (EMIT i) (at level 75) : monad_scope.
   
   (* Begin: a set of basic conversion constructs *)
@@ -540,6 +542,27 @@ Module X86_Compile.
   Definition cast_s s1 s2 (e:rtl_exp s1) := ret (@cast_s_rtl_exp s1 s2 e).
   Definition read_loc s (l:loc s) := ret (get_loc_rtl_exp l).
   Definition write_loc s (e:rtl_exp s) (l:loc s)  := emit set_loc_rtl e l.
+
+  (* Definition write_current_ps s (e: rtl_exp s) : Conv unit := *)
+  (*   fun ts =>  *)
+  (*     let r := c_next ts in *)
+  (*     let ts' := {|c_rev_i := (set_ps_reg_rtl e (ps_reg s r))::c_rev_i ts; *)
+  (*                  c_next := r|} in *)
+  (*     ((), ts'). *)
+
+  (* store the value of e into the current pseudo reg and advance the
+     index of the pseudo reg; it returns an rtl_exp that retrives the
+     value from the storage; *)
+  Definition write_ps_and_fresh s (e: rtl_exp s) : Conv (rtl_exp s) :=
+    fun ts => 
+      let r := c_next ts in
+      let ts' := {|c_rev_i := (set_ps_reg_rtl e (ps_reg s r))::c_rev_i ts;
+                   c_next := r + 1|} in
+      (get_ps_reg_rtl_exp (ps_reg s r), ts').
+
+  (* Definition read_ps s (ps:pseudo_reg s): Conv (rtl_exp s) :=  *)
+  (*   ret (get_ps_reg_rtl_exp ps). *)
+
   Definition read_array l s (a:array l s) (idx:rtl_exp l) := 
     ret (get_array_rtl_exp a idx).
   Definition write_array l s (a:array l s) (idx:rtl_exp l) (v:rtl_exp s) :=
@@ -625,11 +648,6 @@ Module X86_Compile.
     raised_x <- arith shl_op x' c;
     y' <- cast_u (s1+s2+1) y;
     arith add_op raised_x y'.
-
-
-  (* used in the old version of the semantics to copy a pseudo register;
-     now it's a no-op *)
-  Definition copy_ps s (rs:rtl_exp s) := cast_u s rs.
 
   Definition scale_to_int32 (s:scale) : int32 :=
     Word.repr match s with | Scale1 => 1 | Scale2 => 2 | Scale4 => 4 | Scale8 => 8 end.
@@ -1064,8 +1082,8 @@ Module X86_Compile.
       | O => @load_Z size1 0
       | S m =>
         op2 <- compute_parity_aux op1 op2 m;
-        one <- load_Z s 1;
-        op1 <- arith shru_op op1 one; 
+        sf <- load_Z s (Z.of_nat m);
+        op1 <- arith shru_op op1 sf;
         r <- cast_u size1 op1;
         @arith size1 xor_op r op2
     end.
@@ -1090,28 +1108,29 @@ Module X86_Compile.
         p0 <- load seg op ; 
         p1 <- load_Z _ 1 ; 
         p2 <- arith add_op p0 p1 ; 
-        set seg p2 op;;
 
         (* Note that CF is NOT changed by INC *)
 
         zero <- load_Z _ 0;
         ofp <- test lt_op p2 p0;
-        set_flag OF ofp;;
 
         zfp <- test eq_op p2 zero;
-        set_flag ZF zfp;;
 
         sfp <- test lt_op p2 zero;
-        set_flag SF sfp;;
 
         pfp <- compute_parity p2;
-        set_flag PF pfp;;
 
         n0 <- cast_u size4 p0;
         n1 <- load_Z size4 1;
         n2 <- arith add_op n0 n1;
         afp <- test ltu_op n2 n0;
-        set_flag AF afp.
+
+        set_flag OF ofp;;
+        set_flag ZF zfp;;
+        set_flag SF sfp;;
+        set_flag PF pfp;;
+        set_flag AF afp;;
+        set seg p2 op.
 
   Definition conv_DEC (pre: prefix) (w: bool) (op: operand) : Conv unit :=
     let load := load_op pre w in 
@@ -1120,27 +1139,29 @@ Module X86_Compile.
         p0 <- load seg op;
         p1 <- load_Z _ 1;
         p2 <- arith sub_op p0 p1;
-        set seg p2 op;;
 
         (* Note that CF is NOT changed by DEC *)
+
         zero <- load_Z _ 0;
         ofp <- test lt_op p0 p2; 
-        set_flag OF ofp;;
 
         zfp <- test eq_op p2 zero;
-        set_flag ZF zfp;;
         
         sfp <- test lt_op p2 zero;
-        set_flag SF sfp;;
 
         pfp <- compute_parity p2;
-        set_flag PF pfp;;
 
         n0 <- cast_u size4 p0;
         n1 <- load_Z size4 1;
         n2 <- arith sub_op n0 n1;
         afp <- test ltu_op n0 n2;
-        set_flag AF afp.
+
+        set_flag OF ofp;;
+        set_flag ZF zfp;;
+        set_flag SF sfp;;
+        set_flag PF pfp;;
+        set_flag AF afp;;
+        set seg p2 op.
 
   Definition conv_ADC (pre: prefix) (w: bool) (op1 op2: operand) : Conv unit :=
     let load := load_op pre w in 
@@ -1153,50 +1174,58 @@ Module X86_Compile.
         (* RTL for op1 *)
         p0 <- load seg op1;
         p1 <- load seg op2;
-        cf1 <- get_flag CF;
-        cfext <- cast_u _ cf1; 
-        p2 <- arith add_op p0 p1;
-        p2 <- arith add_op p2 cfext;
-        set seg p2 op1;;        
+        cf0 <- get_flag CF;
+        (* store the current CF flag in a pseudo reg *)
+        old_cf <- write_ps_and_fresh cf0;
+        cfext <- cast_u _ old_cf; 
+        p2' <- arith add_op p0 p1;
+        p2 <- arith add_op p2' cfext;
 
         (* RTL for OF *)
-        b0 <- test lt_op zero p0;
-        b1 <- test lt_op zero p1;
-        b2 <- test lt_op zero p2;
+        b0 <- test lt_op p0 zero;
+        b1 <- test lt_op p1 zero;
+        b2 <- test lt_op p2 zero;
         b3 <- @arith size1 xor_op b0 b1;
         b3 <- @arith size1 xor_op up b3;
         b4 <- @arith size1 xor_op b0 b2;
-        b4 <- @arith size1 and_op b3 b4;
-        set_flag OF b4;;
+        ofp <- @arith size1 and_op b3 b4;
 
         (* RTL for CF *)
-        b0 <- test ltu_op p2 p0;
-        b1 <- test ltu_op p2 p1;
-        b0 <- @arith size1 or_op b0 b1;
-        set_flag CF b0;;
+        (* first test if p0+p1 has a carry; then check (p0+p1)+c *)
+        b0 <- test ltu_op p2' p0;
+        b1 <- test ltu_op p2' p1;
+        b2 <- test ltu_op p2 p2';
+        b3 <- test ltu_op p2 cfext;
+        b4 <- @arith size1 or_op b0 b1;
+        b5 <- @arith size1 or_op b2 b3;
+        cfp <- @arith size1 or_op b4 b5;
 
         (* RTL for ZF *)
-        b0 <- test eq_op p2 zero;
-        set_flag ZF b0;;
+        zfp <- test eq_op p2 zero;
 
         (* RTL for SF *)
-        b0 <- test lt_op p2 zero;
-        set_flag SF b0;;
+        sfp <- test lt_op p2 zero;
 
         (* RTL for PF *)
-        b0 <- compute_parity p2;
-        set_flag PF b0;;
+        pfp <- compute_parity p2;
 
         (* RTL for AF *)
         n0 <- cast_u size4 p0;
         n1 <- cast_u size4 p1;
-        cf4 <- cast_u size4 cf1;
+        cf4 <- cast_u size4 old_cf;
         n2 <- @arith size4 add_op n0 n1;
         n2 <- @arith size4 add_op n2 cf4;
         b0 <- test ltu_op n2 n0;
         b1 <- test ltu_op n2 n1;
-        b0 <- @arith size1 or_op b0 b1;
-        set_flag AF b0.
+        afp <- @arith size1 or_op b0 b1;
+
+        set_flag OF ofp;;
+        set_flag CF cfp;;
+        set_flag ZF zfp;;
+        set_flag SF sfp;;
+        set_flag PF pfp;;
+        set_flag AF afp;;
+        set seg p2 op1.
 
 Definition conv_STC: Conv unit :=
   one <- load_Z size1 1;
@@ -1268,32 +1297,33 @@ Definition conv_SAHF: Conv unit :=
   pos <- load_Z size8 7;
   tmp <- @arith size8 shr_op ah pos;
   tmp <- @arith size8 and_op tmp one;
-  b <- test eq_op one tmp;
-  set_flag SF b;;
+  sfp <- test eq_op one tmp;
 
   pos <- load_Z size8 6;
   tmp <- @arith size8 shr_op ah pos;
   tmp <- @arith size8 and_op tmp one;
-  b <- test eq_op one tmp;
-  set_flag ZF b;;
+  zfp <- test eq_op one tmp;
 
   pos <- load_Z size8 4;
   tmp <- @arith size8 shr_op ah pos;
   tmp <- @arith size8 and_op tmp one;
-  b <- test eq_op one tmp;
-  set_flag AF b;;
+  afp <- test eq_op one tmp;
 
   pos <- load_Z size8 2;
   tmp <- @arith size8 shr_op ah pos;
   tmp <- @arith size8 and_op tmp one;
-  b <- test eq_op one tmp;
-  set_flag PF b;;
+  pfp <- test eq_op one tmp;
 
   pos <- load_Z size8 0;
   tmp <- @arith size8 shr_op ah pos;
   tmp <- @arith size8 and_op tmp one;
-  b <- test eq_op one tmp;
-  set_flag CF b. 
+  cfp <- test eq_op one tmp;
+
+  set_flag SF sfp;;
+  set_flag ZF zfp;;
+  set_flag AF afp;;
+  set_flag PF pfp;;
+  set_flag CF cfp.
 
 
   Definition conv_ADD (pre: prefix) (w: bool) (op1 op2: operand) : Conv unit :=
@@ -1308,35 +1338,33 @@ Definition conv_SAHF: Conv unit :=
         p0 <- load seg op1;
         p1 <- load seg op2;
         p2 <- arith add_op p0 p1;
-        set seg p2 op1;;        
 
         (* RTL for OF *)
-        b0 <- test lt_op zero p0;
-        b1 <- test lt_op zero p1;
-        b2 <- test lt_op zero p2;
+        (* b0, b1, b2 are the sign bits of p0, p1, p2, repsectively *)
+        (* overflow bit is set if those three bits are (0,0,1) or (1,1,0) *)
+        (* we compute "not (b0 xor b1) /\ (b0 xor b2)" *)
+        b0 <- test lt_op p0 zero;
+        b1 <- test lt_op p1 zero;
+        b2 <- test lt_op p2 zero;
         b3 <- @arith size1 xor_op b0 b1;
         b3 <- @arith size1 xor_op up b3;
         b4 <- @arith size1 xor_op b0 b2;
-        b4 <- @arith size1 and_op b3 b4;
-        set_flag OF b4;;
+        ofp <- @arith size1 and_op b3 b4;
 
         (* RTL for CF *)
+        (* p0+p1 has a carry bit iff p2<p0 or p2<p1 *)
         b0 <- test ltu_op p2 p0;
         b1 <- test ltu_op p2 p1;
-        b0 <- @arith size1 or_op b0 b1;
-        set_flag CF b0;;
+        cfp <- @arith size1 or_op b0 b1;
 
         (* RTL for ZF *)
-        b0 <- test eq_op p2 zero;
-        set_flag ZF b0;;
+        zfp <- test eq_op p2 zero;
 
         (* RTL for SF *)
-        b0 <- test lt_op p2 zero;
-        set_flag SF b0;;
+        sfp <- test lt_op p2 zero;
 
         (* RTL for PF *)
-        b0 <- compute_parity p2;
-        set_flag PF b0;;
+        pfp <- compute_parity p2;
 
         (* RTL for AF *)
         n0 <- cast_u size4 p0;
@@ -1344,9 +1372,17 @@ Definition conv_SAHF: Conv unit :=
         n2 <- @arith size4 add_op n0 n1;
         b0 <- test ltu_op n2 n0;
         b1 <- test ltu_op n2 n1;
-        b0 <- @arith size1 or_op b0 b1;
-        set_flag AF b0.
+        afp <- @arith size1 or_op b0 b1;
 
+        set_flag OF ofp;;
+        set_flag CF cfp;;
+        set_flag ZF zfp;;
+        set_flag SF sfp;;
+        set_flag PF pfp;;
+        set_flag AF afp;;
+        (* this has to go last as the computing of flags relies on the
+           old op1 value *)
+        set seg p2 op1.
 
   (* If e is true, then this is sub, otherwise it's cmp 
      Dest is equal to op1 for the case of SUB,
@@ -1364,7 +1400,7 @@ Definition conv_SAHF: Conv unit :=
     let set := set_op pre w in 
         (* RTL for useful constants *)
         zero <- load_Z _ 0;
-        up <- load_Z size1 1;
+        one <- load_Z size1 1;
 
         (* RTL for op1 *)
         p0 <- load seg1 op1;
@@ -1372,38 +1408,39 @@ Definition conv_SAHF: Conv unit :=
         p2 <- arith sub_op p0 p1;
 
         (* RTL for OF *)
-        negp1 <- arith sub_op zero p1;
-        b0 <- test lt_op zero p0;
-        b1 <- test lt_op zero negp1;
-        b2 <- test lt_op zero p2;
+        b0 <- test lt_op p0 zero;
+        b1' <- test lt_op p1 zero;
+        (* b1 = not (p1 < 0) *)
+        b1 <- arith xor_op b1' one;
+        b2 <- test lt_op p2 zero;
         b3 <- @arith size1 xor_op b0 b1;
-        b3 <- @arith size1 xor_op up b3;
+        b3 <- @arith size1 xor_op b3 one;
         b4 <- @arith size1 xor_op b0 b2;
-        b4 <- @arith size1 and_op b3 b4;
-        set_flag OF b4;;
+        ofp <- @arith size1 and_op b3 b4;
 
         (* RTL for CF *)
-        b0 <- test ltu_op p0 p1;
-        set_flag CF b0;;
+        cfp <- test ltu_op p0 p1;
 
         (* RTL for ZF *)
-        b0 <- test eq_op p2 zero;
-        set_flag ZF b0;;
+        zfp <- test eq_op p2 zero;
 
         (* RTL for SF *)
-        b0 <- test lt_op p2 zero;
-        set_flag SF b0;;
+        sfp <- test lt_op p2 zero;
 
         (* RTL for PF *)
-        b0 <- compute_parity p2;
-        set_flag PF b0;;
+        pfp <- compute_parity p2;
 
         (* RTL for AF *)
         n0 <- cast_u size4 p0;
         n1 <- cast_u size4 p1;
-        b0 <- test ltu_op p0 p1;
-        set_flag AF b0;;
+        afp <- test ltu_op p0 p1;
 
+        set_flag OF ofp;;
+        set_flag CF cfp;;
+        set_flag ZF zfp;;
+        set_flag SF sfp;;
+        set_flag PF pfp;;
+        set_flag AF afp;;
         if e then
           set segdest p2 dest
         else 
@@ -1425,52 +1462,59 @@ Definition conv_SAHF: Conv unit :=
     let seg := get_segment_op2 pre DS op1 op2 in
         (* RTL for useful constants *)
         zero <- load_Z _ 0;
-        up <- load_Z size1 1;
+        one <- load_Z size1 1;
         
-        old_cf <- get_flag CF;
+        cf0 <- get_flag CF;
+        (* store the current CF flag in a pseudo reg *)
+        old_cf <- write_ps_and_fresh cf0;
         old_cf_ext <- cast_u _ old_cf;
         (* RTL for op1 *)
         p0 <- load seg op1;
         p1 <- load seg op2;
-        p2_0 <- arith sub_op p0 p1;
-        p2 <- arith sub_op p2_0 old_cf_ext;
+        p1' <- arith sub_op p0 p1;
+        p2 <- arith sub_op p1' old_cf_ext;
 
         (* RTL for OF *)
-        negp1 <- arith sub_op zero p1;
-        b0 <- test lt_op zero p0;
-        b1 <- test lt_op zero negp1;
-        b2 <- test lt_op zero p2;
+        b0 <- test lt_op p0 zero;
+        b1' <- test lt_op p1 zero;
+        (* b1 = not (p1 < 0) *)
+        b1 <- arith xor_op b1' one; 
+        b2 <- test lt_op p2 zero;
         b3 <- @arith size1 xor_op b0 b1;
-        b3 <- @arith size1 xor_op up b3;
+        b3 <- @arith size1 xor_op b3 one;
         b4 <- @arith size1 xor_op b0 b2;
-        b4 <- @arith size1 and_op b3 b4;
-        set_flag OF b4;;
+        ofp <- @arith size1 and_op b3 b4;
 
         (* RTL for CF *)
-        b0' <- test ltu_op p0 p1;
-        b0'' <- test eq_op p0 p1;
-        b0 <- arith or_op b0' b0'';
-        set_flag CF b0;;
+        (* first test if p0 < p1 to see if there is a carry in p0 - p1;
+           then test if p0-p1 < c to see if there is a carry in (p0-p1)- c;
+           cannot just test if p0 < p1+c because p1+c may overflow; *)
+        b0 <- test ltu_op p0 p1;
+        b1 <- test ltu_op p1' old_cf_ext;
+        cfp <- arith or_op b0 b1;
 
         (* RTL for ZF *)
-        b0 <- test eq_op p2 zero;
-        set_flag ZF b0;;
+        zfp <- test eq_op p2 zero;
 
         (* RTL for SF *)
-        b0 <- test lt_op p2 zero;
-        set_flag SF b0;;
+        sfp <- test lt_op p2 zero;
 
         (* RTL for PF *)
-        b0 <- compute_parity p2;
-        set_flag PF b0;;
+        pfp <- compute_parity p2;
 
         (* RTL for AF *)
         n0 <- cast_u size4 p0;
         n1 <- cast_u size4 p1;
         b0' <- test ltu_op p0 p1;
         b0'' <- test eq_op p0 p1;
-        b0 <- arith or_op b0' b0'';
-        set_flag AF b0;;
+        afp <- arith or_op b0' b0'';
+
+        set_flag OF ofp;;
+        set_flag CF cfp;;
+        set_flag ZF zfp;;
+        set_flag SF sfp;;
+        set_flag PF pfp;;
+        set_flag AF afp;;
         set seg p2 op1.
 
   (* I tried refactoring this so that it was smaller, but the way I did
@@ -1486,63 +1530,75 @@ Definition conv_SAHF: Conv unit :=
       undef_flag AF;;
       undef_flag PF;;
       match op_override pre, w with
-        | _, false => dividend <- iload_op16 seg (Reg_op EAX);
-                      divisor <- iload_op8 seg op;
-                      zero <- load_Z _ 0;
-                      divide_by_zero <- test eq_op zero divisor;
-                      if_trap divide_by_zero;;
-                      divisor_ext <- cast_u _ divisor;
-                      quotient <- arith divu_op dividend divisor_ext;
-                      max_quotient <- load_Z _ 255;
-                      div_error <- test ltu_op max_quotient quotient;
-                      if_trap div_error;;
-                      remainder <- arith modu_op dividend divisor_ext;
-                      quotient_trunc <- cast_u _ quotient;
-                      remainder_trunc <- cast_u _ remainder;
-                      iset_op8 seg quotient_trunc (Reg_op EAX);;
-                      iset_op8 seg remainder_trunc (Reg_op ESP) (* This is AH *)
-       | true, true => dividend_lower <- iload_op16 seg (Reg_op EAX);
-                       dividend_upper <- iload_op16 seg (Reg_op EDX);
-                       dividend0 <- cast_u size32 dividend_upper;
-                       sixteen <- load_Z size32 16;
-                       dividend1 <- arith shl_op dividend0 sixteen;
-                       dividend_lower_ext <- cast_u size32 dividend_lower;
-                       dividend <- arith or_op dividend1 dividend_lower_ext;
-                       divisor <- iload_op16 seg op;
-                       zero <- load_Z _ 0;
-                       divide_by_zero <- test eq_op zero divisor;
-                       if_trap divide_by_zero;;
-                       divisor_ext <- cast_u _ divisor;
-                       quotient <- arith divu_op dividend divisor_ext;
-                       max_quotient <- load_Z _ 65535;
-                       div_error <- test ltu_op max_quotient quotient;
-                       if_trap div_error;;
-                       remainder <- arith modu_op dividend divisor_ext;
-                       quotient_trunc <- cast_u _ quotient;
-                       remainder_trunc <- cast_u _ remainder;
-                       iset_op16 seg quotient_trunc (Reg_op EAX);;
-                       iset_op16 seg remainder_trunc (Reg_op EDX) 
-       | false, true => dividend_lower <- iload_op32 seg (Reg_op EAX);
-                       dividend_upper <- iload_op32 seg (Reg_op EDX);
-                       dividend0 <- cast_u 63 dividend_upper;
-                       thirtytwo <- load_Z 63 32;
-                       dividend1 <- arith shl_op dividend0 thirtytwo;
-                       dividend_lower_ext <- cast_u _ dividend_lower;
-                       dividend <- arith or_op dividend1 dividend_lower_ext;
-                       divisor <- iload_op32 seg op;
-                       zero <- load_Z _ 0;
-                       divide_by_zero <- test eq_op zero divisor;
-                       if_trap divide_by_zero;;
-                       divisor_ext <- cast_u _ divisor;
-                       quotient <- arith divu_op dividend divisor_ext;
-                       max_quotient <- load_Z _ 4294967295;
-                       div_error <- test ltu_op max_quotient quotient;
-                       if_trap div_error;;
-                       remainder <- arith modu_op dividend divisor_ext;
-                       quotient_trunc <- cast_u _ quotient;
-                       remainder_trunc <- cast_u _ remainder;
-                       iset_op32 seg quotient_trunc (Reg_op EAX);;
-                       iset_op32 seg remainder_trunc (Reg_op EDX) 
+        | _, false => 
+          eax <- iload_op16 seg (Reg_op EAX);
+          (* store the old eax since later on we may update both eax and op *)
+          dividend <- write_ps_and_fresh eax;
+          op_val <- iload_op8 seg op;
+          (* store the old op value since the update on eax may change it 
+             when op is eax *)
+          divisor <- write_ps_and_fresh op_val;
+          zero <- load_Z _ 0;
+          divide_by_zero <- test eq_op zero divisor;
+          if_trap divide_by_zero;;
+          divisor_ext <- cast_u _ divisor;
+          quotient <- arith divu_op dividend divisor_ext;
+          max_quotient <- load_Z _ 255;
+          div_error <- test ltu_op max_quotient quotient;
+          if_trap div_error;;
+          remainder <- arith modu_op dividend divisor_ext;
+          quotient_trunc <- cast_u _ quotient;
+          remainder_trunc <- cast_u _ remainder;
+          iset_op8 seg quotient_trunc (Reg_op EAX);;
+          iset_op8 seg remainder_trunc (Reg_op ESP) (* This is AH *)
+        | true, true => 
+          eax <- iload_op16 seg (Reg_op EAX);
+          dividend_lower <- write_ps_and_fresh eax;
+          dividend_upper <- iload_op16 seg (Reg_op EDX);
+          dividend0 <- cast_u size32 dividend_upper;
+          sixteen <- load_Z size32 16;
+          dividend1 <- arith shl_op dividend0 sixteen;
+          dividend_lower_ext <- cast_u size32 dividend_lower;
+          dividend <- arith or_op dividend1 dividend_lower_ext;
+          op_val <- iload_op16 seg op;
+          divisor <- write_ps_and_fresh op_val;
+          zero <- load_Z _ 0;
+          divide_by_zero <- test eq_op zero divisor;
+          if_trap divide_by_zero;;
+          divisor_ext <- cast_u _ divisor;
+          quotient <- arith divu_op dividend divisor_ext;
+          max_quotient <- load_Z _ 65535;
+          div_error <- test ltu_op max_quotient quotient;
+          if_trap div_error;;
+          remainder <- arith modu_op dividend divisor_ext;
+          quotient_trunc <- cast_u _ quotient;
+          remainder_trunc <- cast_u _ remainder;
+          iset_op16 seg quotient_trunc (Reg_op EAX);;
+          iset_op16 seg remainder_trunc (Reg_op EDX) 
+        | false, true => 
+          oe <- iload_op32 seg (Reg_op EAX);
+          dividend_lower <- write_ps_and_fresh oe;
+          dividend_upper <- iload_op32 seg (Reg_op EDX);
+          dividend0 <- cast_u 63 dividend_upper;
+          thirtytwo <- load_Z 63 32;
+          dividend1 <- arith shl_op dividend0 thirtytwo;
+          dividend_lower_ext <- cast_u _ dividend_lower;
+          dividend <- arith or_op dividend1 dividend_lower_ext;
+          op_val <- iload_op32 seg op;
+          divisor <- write_ps_and_fresh op_val;
+          zero <- load_Z _ 0;
+          divide_by_zero <- test eq_op zero divisor;
+          if_trap divide_by_zero;;
+          divisor_ext <- cast_u _ divisor;
+          quotient <- arith divu_op dividend divisor_ext;
+          max_quotient <- load_Z _ 4294967295;
+          div_error <- test ltu_op max_quotient quotient;
+          if_trap div_error;;
+          remainder <- arith modu_op dividend divisor_ext;
+          quotient_trunc <- cast_u _ quotient;
+          remainder_trunc <- cast_u _ remainder;
+          iset_op32 seg quotient_trunc (Reg_op EAX);;
+          iset_op32 seg remainder_trunc (Reg_op EDX) 
      end.
 
   Definition conv_IDIV (pre: prefix) (w: bool) (op: operand) :=
@@ -1554,8 +1610,10 @@ Definition conv_SAHF: Conv unit :=
       undef_flag AF;;
       undef_flag PF;;
       match op_override pre, w with
-        | _, false => dividend <- iload_op16 seg (Reg_op EAX);
-                      divisor <- iload_op8 seg op;
+        | _, false => eax <- iload_op16 seg (Reg_op EAX);
+                      dividend <- write_ps_and_fresh eax;
+                      op_val <- iload_op8 seg op;
+                      divisor <- write_ps_and_fresh op_val;
                       zero <- load_Z _ 0;
                       divide_by_zero <- test eq_op zero divisor;
                       if_trap divide_by_zero;;
@@ -1572,14 +1630,16 @@ Definition conv_SAHF: Conv unit :=
                       remainder_trunc <- cast_s _ remainder;
                       iset_op8 seg quotient_trunc (Reg_op EAX);;
                       iset_op8 seg remainder_trunc (Reg_op ESP) (* This is AH *)
-       | true, true => dividend_lower <- iload_op16 seg (Reg_op EAX);
+       | true, true => eax <- iload_op16 seg (Reg_op EAX);
+                       dividend_lower <- write_ps_and_fresh eax;
                        dividend_upper <- iload_op16 seg (Reg_op EDX);
                        dividend0 <- cast_s size32 dividend_upper;
                        sixteen <- load_Z size32 16;
                        dividend1 <- arith shl_op dividend0 sixteen;
                        dividend_lower_ext <- cast_s size32 dividend_lower;
                        dividend <- arith or_op dividend1 dividend_lower_ext;
-                       divisor <- iload_op16 seg op;
+                       op_val <- iload_op16 seg op;
+                       divisor <- write_ps_and_fresh op_val;
                        zero <- load_Z _ 0;
                        divide_by_zero <- test eq_op zero divisor;
                        if_trap divide_by_zero;;
@@ -1596,14 +1656,16 @@ Definition conv_SAHF: Conv unit :=
                        remainder_trunc <- cast_s _ remainder;
                        iset_op16 seg quotient_trunc (Reg_op EAX);;
                        iset_op16 seg remainder_trunc (Reg_op EDX) 
-       | false, true => dividend_lower <- iload_op32 seg (Reg_op EAX);
+       | false, true => eax <- iload_op32 seg (Reg_op EAX);
+                       dividend_lower <- write_ps_and_fresh eax;
                        dividend_upper <- iload_op32 seg (Reg_op EDX);
                        dividend0 <- cast_s 63 dividend_upper;
                        thirtytwo <- load_Z 63 32;
                        dividend1 <- arith shl_op dividend0 thirtytwo;
                        dividend_lower_ext <- cast_s _ dividend_lower;
                        dividend <- arith or_op dividend1 dividend_lower_ext;
-                       divisor <- iload_op32 seg op;
+                       op_val <- iload_op32 seg op;
+                       divisor <- write_ps_and_fresh op_val;
                        zero <- load_Z _ 0;
                        divide_by_zero <- test eq_op zero divisor;
                        if_trap divide_by_zero;;
@@ -1628,10 +1690,13 @@ Definition conv_SAHF: Conv unit :=
     undef_flag ZF;;
     undef_flag AF;;
     undef_flag PF;;
-    (match opopt2 with | None => let load := load_op pre w in
-                let seg := get_segment_op pre DS op1 in
-                 p1 <- load seg (Reg_op EAX);
-                 p2 <- load seg op1;
+    match opopt2 with
+     | None => let load := load_op pre w in
+               let seg := get_segment_op pre DS op1 in
+                 eax <- load seg (Reg_op EAX);
+                 p1 <- write_ps_and_fresh eax;
+                 op1_val <- load seg op1;
+                 p2 <- write_ps_and_fresh op1_val;
                  p1ext <- cast_s (2*((opsize (op_override pre) w)+1)-1) p1;
                  p2ext <- cast_s (2*((opsize (op_override pre) w)+1)-1) p2;
                  res <- arith mul_op p1ext p2ext;
@@ -1641,12 +1706,28 @@ Definition conv_SAHF: Conv unit :=
                  upperhalf <- cast_s (opsize (op_override pre) w) res_shifted;
                  zero <- load_Z _  0;
                  max <- load_Z _ (Word.max_unsigned (opsize (op_override pre) w));
+                 
+                 (* CF and OF are set when siginificant bits, including the sign bit,
+                    are carried to the upper half of the result; that is, when
+                    (1) upperhalf is non-zero and non-max, or (2) upperhalf is zero,
+                    but the significant bit of lower half is one, or (3) upperhalf
+                    is max (all 1s) and the siginicant bit of lower half is zero *)
                  b0 <- test eq_op upperhalf zero;
                  b1 <- test eq_op upperhalf max;
-                 b2 <- arith or_op b0 b1;
-                 flag <- not b2;
+                 b2 <- test lt_op lowerhalf zero;
+                 (* b4 is condition (1) above *)
+                 b3 <- arith or_op b0 b1;
+                 b4 <- not b3;
+                 (* b5 is condition (2) above *)
+                 b5 <- arith and_op b0 b2;
+                 (* b7 is condition (3) above *)
+                 b6 <- not b2;
+                 b7 <- arith and_op b1 b6;
+                 b8 <- arith or_op b4 b5;
+                 flag <- arith or_op b7 b8;
                  set_flag CF flag;;
                  set_flag OF flag;;
+
                  match (op_override pre), w with
                    | _, false => iset_op16 seg res (Reg_op EAX) 
                    | _, true =>  let set := set_op pre w in
@@ -1670,7 +1751,8 @@ Definition conv_SAHF: Conv unit :=
                       set_flag CF flag;;
                       set_flag OF flag;;
                       set seg lowerhalf op1
-          |Some imm3  =>  let load := load_op pre w in
+          | Some imm3  =>
+                    let load := load_op pre w in
                     let set := set_op pre w in
                     let seg := get_segment_op2 pre DS op1 op2 in
                       p1 <- load seg op2;
@@ -1686,11 +1768,9 @@ Definition conv_SAHF: Conv unit :=
                       set_flag OF flag;;
                       set seg lowerhalf op1
         end
-    end).
+    end.
     Obligation 1. unfold opsize. 
       destruct (op_override pre); simpl; auto. Defined.
-
-
 
   Definition conv_MUL (pre: prefix) (w: bool) (op: operand) :=
     let seg := get_segment_op pre DS op in
@@ -1704,13 +1784,16 @@ Definition conv_SAHF: Conv unit :=
                     p1ext <- cast_u size16 p1;
                     p2ext <- cast_u size16 p2;
                     res <- arith mul_op p1ext p2ext;
-                    iset_op16 seg res (Reg_op EAX);;
                     max <- load_Z _ 255;
                     cf_test <- test ltu_op max res;
                     set_flag CF cf_test;;
-                    set_flag OF cf_test
-      | true, true => p1 <- iload_op16 seg op;
-                    p2 <- iload_op16 seg (Reg_op EAX);
+                    set_flag OF cf_test;;
+                    iset_op16 seg res (Reg_op EAX)
+      | true, true => 
+                    op_val <- iload_op16 seg op;
+                    p1 <- write_ps_and_fresh op_val;
+                    eax <- iload_op16 seg (Reg_op EAX); 
+                    p2 <- write_ps_and_fresh eax;
                     p1ext <- cast_u size32 p1;
                     p2ext <- cast_u size32 p2;
                     res <- arith mul_op p1ext p2ext;
@@ -1718,14 +1801,17 @@ Definition conv_SAHF: Conv unit :=
                     sixteen <- load_Z size32 16;
                     res_shifted <- arith shru_op res sixteen;
                     res_upper <- cast_u size16 res_shifted;
-                    iset_op16 seg res_lower (Reg_op EAX);;
-                    iset_op16 seg res_upper (Reg_op EDX);;
                     zero <- load_Z size16 0;
                     cf_test <- test ltu_op zero res_upper;
                     set_flag CF cf_test;;
-                    set_flag OF cf_test
-      | false, true => p1 <- iload_op32 seg op;
-                    p2 <- iload_op32 seg (Reg_op EAX);
+                    set_flag OF cf_test;;
+                    iset_op16 seg res_lower (Reg_op EAX);;
+                    iset_op16 seg res_upper (Reg_op EDX)
+      | false, true => 
+                    op_val <- iload_op32 seg op;
+                    p1 <- write_ps_and_fresh op_val;
+                    eax <- iload_op32 seg (Reg_op EAX);
+                    p2 <- write_ps_and_fresh eax;
                     p1ext <- cast_u 63 p1;
                     p2ext <- cast_u 63 p2;
                     res <- arith mul_op p1ext p2ext;
@@ -1733,12 +1819,12 @@ Definition conv_SAHF: Conv unit :=
                     thirtytwo <- load_Z 63 32;
                     res_shifted <- arith shru_op res thirtytwo;
                     res_upper <- cast_u size32 res_shifted;
-                    iset_op32 seg res_lower (Reg_op EAX);;
-                    iset_op32 seg res_upper (Reg_op EDX);;
                     zero <- load_Z size32 0;
                     cf_test <- test ltu_op zero res_upper;
                     set_flag CF cf_test;;
-                    set_flag OF cf_test
+                    set_flag OF cf_test;;
+                    iset_op32 seg res_lower (Reg_op EAX);;
+                    iset_op32 seg res_upper (Reg_op EDX)
    end.
 
   Definition conv_shift shift (pre: prefix) (w: bool) (op1: operand) (op2: reg_or_immed) :=
@@ -1797,7 +1883,8 @@ Definition conv_SAHF: Conv unit :=
     p2cast <- cast_u ((opsize (op_override pre) w) + 1) p2;
     
     tmp <- cast_u ((opsize (op_override pre) w) + 1) p1;
-    cf <- get_flag CF;
+    cf0 <- get_flag CF; 
+    cf <- write_ps_and_fresh cf0;
     cf <- cast_u ((opsize (op_override pre) w) + 1) cf;
     tt <- load_Z _ (Z_of_nat ((opsize (op_override pre) w) + 1));
     cf <- arith shl_op cf tt;
@@ -1837,7 +1924,8 @@ Definition conv_SAHF: Conv unit :=
 
     tmp <- cast_u ((opsize (op_override pre) w) + 1) p1;
     tmp <- arith shl_op tmp oneshift;
-    cf <- get_flag CF;
+    cf0 <- get_flag CF;
+    cf <- write_ps_and_fresh cf0;
     cf <- cast_u ((opsize (op_override pre) w) + 1) cf;
     tmp <- arith or_op tmp cf;
     tmp <- arith ror_op tmp p2cast;
@@ -1848,7 +1936,6 @@ Definition conv_SAHF: Conv unit :=
     undef_flag OF;;
     set_flag CF cf;;
     set seg p3 op1.
-
 
   Definition conv_SHLD pre (op1: operand) (r: register) ri :=
     let load := load_op pre true in
@@ -1958,18 +2045,18 @@ Definition conv_SAHF: Conv unit :=
   Definition conv_AAA_AAS (op1: bit_vector_op) : Conv unit :=
     pnine <- load_Z size8 9;
     p0Fmask <- load_Z size8 15;
-    paf <- get_flag AF;
-    pal <- get_AL;
+    af_val <- get_flag AF;
+    paf <- write_ps_and_fresh af_val;
+    al <- get_AL;
+    pal <- write_ps_and_fresh al;
     digit1 <- arith and_op pal p0Fmask;
     cond1 <- test lt_op pnine digit1;
     cond <- arith or_op cond1 paf;
 
-    pah <- get_AH;
+    ah <- get_AH;
+    pah <- write_ps_and_fresh ah;
     (*Else branch*)
     pfalse <- load_Z size1 0;
-    v_ah0 <- copy_ps pah;
-    v_af0 <- copy_ps pfalse;
-    v_cf0 <- copy_ps pfalse;
     v_al0 <- arith and_op pal p0Fmask;
     
     (*If branch*)
@@ -1980,24 +2067,20 @@ Definition conv_SAHF: Conv unit :=
     pal_cmask <- arith and_op pal_c p0Fmask;
     v_al <- if_exp cond pal_cmask v_al0;
     
-    pah <- get_AH;
     pah_c <- arith op1 pah pone;
-    v_ah <- if_exp cond pah_c v_ah0;
-    v_af <- if_exp cond ptrue v_af0;
-    v_cf <- if_exp cond ptrue v_cf0;
+    v_ah <- if_exp cond pah_c pah;
+    v_af <- if_exp cond ptrue pfalse;
+    v_cf <- if_exp cond ptrue pfalse;
 
     (*Set final values*)
-    set_AL v_al;;
-    set_AH v_ah;;
     set_flag AF v_af;;
     set_flag CF v_cf;;
-
     undef_flag OF;;
     undef_flag SF;;
     undef_flag ZF;;
-    undef_flag PF
-    .
-
+    undef_flag PF;;
+    set_AL v_al;;
+    set_AH v_ah.
 
   Definition conv_AAD : Conv unit :=
     pal <- get_AL;
@@ -2009,27 +2092,26 @@ Definition conv_SAHF: Conv unit :=
     tensval <- arith mul_op pah pten;
     pal_c <- arith add_op pal tensval;
     pal_cmask <- arith and_op pal_c pFF;
-    set_AL pal_cmask;;
-    set_AH pzero;;
 
-    b0 <- test eq_op pal_cmask pzero;
-    set_flag ZF b0;;
-    b1 <- test lt_op pal_cmask pzero;
-    set_flag SF b1;;
-    b2 <- compute_parity pal_cmask;
-    set_flag PF b2;;
+    zfp <- test eq_op pal_cmask pzero;
+    set_flag ZF zfp;;
+    sfp <- test lt_op pal_cmask pzero;
+    set_flag SF sfp;;
+    pfp <- compute_parity pal_cmask;
+    set_flag PF pfp;;
     undef_flag OF;;
     undef_flag AF;;
-    undef_flag CF
-    .
+    undef_flag CF;;
+
+    (* ordering important *)
+    set_AL pal_cmask;;
+    set_AH pzero.
 
   Definition conv_AAM : Conv unit :=
     pal <- get_AL;
     pten <- load_Z size8 10;
     digit1 <- arith divu_op pal pten;
     digit2 <- arith modu_op pal pten;
-    set_AH digit1;;
-    set_AL digit2;;
 
     pzero <- load_Z size8 0;
     b0 <- test eq_op digit2 pzero;
@@ -2040,8 +2122,11 @@ Definition conv_SAHF: Conv unit :=
     set_flag PF b2;;
     undef_flag OF;;
     undef_flag AF;;
-    undef_flag CF
-    .
+    undef_flag CF;;
+
+    (* ordering important *)
+    set_AH digit1;;
+    set_AL digit2.
 
   Definition testcarryAdd s (p1:rtl_exp s) p2 p3 : Conv (rtl_exp size1) :=
     b0 <-test ltu_op p3 p1;
@@ -2055,15 +2140,16 @@ Definition conv_SAHF: Conv unit :=
   Definition conv_DAA_DAS (op1: bit_vector_op) 
     (tester: (rtl_exp size8) -> (rtl_exp size8) -> (rtl_exp size8) ->
       Conv (rtl_exp size1)) : Conv unit :=
-    pal <- @choose size8;
-    set_AL pal;;
     undef_flag CF;;
     undef_flag AF;;
     undef_flag SF;;
     undef_flag ZF;;
     undef_flag PF;;
-    undef_flag OF
-  .
+    undef_flag OF;;
+
+    pal <- @choose size8;
+    set_AL pal.
+
 (*
   Definition conv_DAA_DAS (op1: bit_vector_op) tester: Conv unit :=
     pal <- get_AL;
@@ -2191,9 +2277,10 @@ Definition conv_SAHF: Conv unit :=
       value <- loadmem oldesp;
       offset <- load_Z size32 espoffset;
       newesp <- arith add_op oldesp offset;
-      set_reg newesp ESP;;
-      set value op
-      .
+      (* set op before changing esp *)
+      set value op;;
+      set_reg newesp ESP.
+
   Definition conv_POPA (pre:prefix) :=
     let espoffset := match (op_override pre) with
                        | true => 2%Z
@@ -2225,8 +2312,7 @@ Definition conv_SAHF: Conv unit :=
     offset <- load_Z size32 espoffset;
     newesp <- arith sub_op oldesp offset;
     setmem p0 newesp;;
-    set_reg newesp ESP
-    .
+    set_reg newesp ESP.
 
   Definition conv_PUSH_pseudo (pre:prefix) (w:bool) 
     pr  := (* (pr: pseudo_reg (opsize (op_override pre) w)) *)
@@ -2241,8 +2327,7 @@ Definition conv_SAHF: Conv unit :=
     offset <- load_Z size32 espoffset;
     newesp <- arith sub_op oldesp offset;
     setmem pr newesp;;
-    set_reg newesp ESP
-    .
+    set_reg newesp ESP.
 
 (*
     let seg := get_segment pre SS in
@@ -2273,8 +2358,7 @@ Definition conv_PUSHA (pre:prefix) :=
     conv_PUSH_pseudo pre true oldesp;;
     pushrtl EBP;;
     pushrtl ESI;;
-    pushrtl EDI
-.
+    pushrtl EDI.
 
 Definition get_and_place T dst pos fl: Conv (rtl_exp T) :=
   fl <- get_flag fl;
@@ -2322,8 +2406,8 @@ Definition conv_POP_pseudo (pre: prefix) :=
         oldesp <- load_reg ESP;
         offset <- load_Z size32 espoffset;
         newesp <- arith add_op oldesp offset;
-        set_reg newesp ESP;;
-        loadmem oldesp.
+        loadmem oldesp;;
+        set_reg newesp ESP.
 
 Definition extract_and_set T value pos fl: Conv unit :=
   one <- load_Z T 1;
@@ -2398,14 +2482,14 @@ Definition conv_POPF pre :=
         value <- load_mem32 SS oldesp;
         four <- load_Z size32 4;
         newesp <- arith add_op oldesp four;
+        set_pc value;;
         (match disp with
            | None => set_reg newesp ESP
            | Some imm => imm0 <- load_int imm;
              imm <- cast_u size32 imm0;
              newesp2 <- arith add_op newesp imm;
              set_reg newesp2 ESP
-         end);;
-        set_pc value
+         end)
       else
         raise_error.
   
@@ -2419,7 +2503,6 @@ Definition conv_POPF pre :=
     p0 <- load_reg ECX;
     p1 <- load_Z _ 1;
     p2 <- arith sub_op p0 p1;
-    set_reg p2 ECX;;
     pzero <- load_Z _ 0;
     pcz <- test eq_op p2 pzero;
     pcnz <- arith xor_op pcz ptrue;
@@ -2444,7 +2527,10 @@ Definition conv_POPF pre :=
        |false => load_Z size32 (-1%Z)
      end);
     eip2 <- arith and_op eip1 eipmask;
-    if_set_loc bcond eip2 pc_loc.
+    (* update pc before updating ecx as the new pc depends on old pc
+       and old ECX and new ECX depends only on the old ECX *)
+    if_set_loc bcond eip2 pc_loc;;
+    set_reg p2 ECX.
 
   (************************)
   (* Misc Ops             *)
@@ -2480,10 +2566,11 @@ Definition conv_POPF pre :=
       src <- iload_op32 seg op2;
       zero <- load_Z size32 0;
       zf <- test eq_op src zero;
-      set_flag ZF zf;;
       res0 <- conv_BS_aux d size32 src;
       res1 <- @choose _;
       res <- if_exp zf res1 res0;
+
+      set_flag ZF zf;;
       iset_op32 seg res op1.
 
   Definition conv_BSF p op1 op2 := conv_BS true p op1 op2.
@@ -2528,10 +2615,7 @@ Definition conv_POPF pre :=
     let set := set_mem pre w seg in
     value <- load addr;
     newvalue <- modify_Bit value poff bitval;
-    (* adding copy_ps makes the proof much easier since it meets the pattern 
-             "addr <- v; set_mem_n ... addr" *)
-    newaddr <- copy_ps addr; 
-    set newvalue newaddr.
+    set newvalue addr.
 
   (* id, comp, set, or reset on a single bit, depending on the params*)
   Definition fbit (param1: bool) (param2: bool) (v: rtl_exp size1):
@@ -2539,7 +2623,7 @@ Definition conv_POPF pre :=
     match param1, param2 with
       | true, true => load_Z size1 1
       | true, false => load_Z size1 0
-      | false, true => copy_ps v
+      | false, true => ret v
       | false, false => not v
     end.
 
@@ -2560,7 +2644,7 @@ Definition conv_POPF pre :=
       (match regimm with
          | Imm_op i =>
            arith modu_op pi popsz
-         | _ => copy_ps pi
+         | _ => ret pi
        end
       );
     popsz_bytes <- load_Z size32 ((BinInt.Z_of_nat (opsz + 1))/8);
@@ -2577,24 +2661,23 @@ Definition conv_POPF pre :=
            be shifted one more down, and the offset needs to be made positive *)
         isneg <- test lt_op bitoffset pzero;
         (*nbitoffset:size_opsz and nwordoffset:size32 are final signed values*)
-        nbitoffset0 <- copy_ps bitoffset;
-        nwordoffset0 <- copy_ps wordoffset;
         (*If the bitoffset was lt zero, we need to adjust values to make them positive*)
         negbitoffset <- arith add_op popsz bitoffset;
         negwordoffset <- arith add_op pneg1 wordoffset;
         nbitoffset1 <- cast_u _ negbitoffset;
-        nbitoffset <- if_exp isneg nbitoffset1 nbitoffset0;
+        nbitoffset <- if_exp isneg nbitoffset1 bitoffset;
 
         nwordoffset1 <- cast_u _ negwordoffset;
-        nwordoffset <- if_exp isneg nwordoffset1 nwordoffset0;
+        nwordoffset <- if_exp isneg nwordoffset1 wordoffset;
 
         newaddrdelta <- arith mul_op nwordoffset popsz_bytes;
         newaddr <- arith add_op newaddrdelta psaddr;
         
         value <- lmem newaddr;
         bt <- get_Bit value nbitoffset;
-        set_flag CF bt;;
         newbt <- fbit param1 param2 bt;
+
+        set_flag CF bt;;
         set_Bit_mem pre true op1 newaddr nbitoffset newbt in
     match op1 with
       | Imm_op _ => raise_error
@@ -2602,8 +2685,8 @@ Definition conv_POPF pre :=
         value <- load (Reg_op r1);
         bitoffset <- arith modu_op rawoffset popsz;
         bt <- get_Bit value bitoffset;
-        set_flag CF bt;;
         newbt <- fbit param1 param2 bt;
+        set_flag CF bt;;
         set_Bit pre true op1 bitoffset newbt
       | Address_op a => 
         psaddr <- compute_addr a;
@@ -2611,10 +2694,8 @@ Definition conv_POPF pre :=
       | Offset_op ioff => 
         psaddr <- load_int ioff;
         btmem psaddr
-    end
-.
+    end.
 
-    
   Definition conv_BSWAP (pre: prefix) (r: register) :=
     let seg := get_segment pre DS in
       eight <- load_Z size32 8;
@@ -2662,18 +2743,17 @@ Definition conv_POPF pre :=
                    sixteen <- load_Z _ 16;
                    p2_top0 <- arith shr_op p2 sixteen;
                    p2_top <- cast_s size16 p2_top0;
-                   iset_op16 seg p2_bottom (Reg_op EAX);;
-                   iset_op16 seg p2_top (Reg_op EDX)
+                   iset_op16 seg p2_top (Reg_op EDX);;
+                   iset_op16 seg p2_bottom (Reg_op EAX)
         | false =>  p1 <- iload_op32 seg (Reg_op EAX);
                    p2 <- cast_s 63 p1;
                    p2_bottom <- cast_s size32 p2;
                    thirtytwo <- load_Z _ 32;
                    p2_top0 <- arith shr_op p2 thirtytwo;
                    p2_top <- cast_s size32 p2_top0;
-                   iset_op32 seg p2_bottom (Reg_op EAX);;
-                   iset_op32 seg p2_top (Reg_op EDX)
+                   iset_op32 seg p2_top (Reg_op EDX);;
+                   iset_op32 seg p2_bottom (Reg_op EAX)
       end.
-          
 
   Definition conv_MOV (pre: prefix) (w: bool) (op1 op2: operand) : Conv unit :=
     let load := load_op pre w in 
@@ -2724,9 +2804,10 @@ Definition conv_POPF pre :=
     let set := set_op pre w in
     let seg := get_segment_op2 pre DS op1 op2 in
         p1 <- load seg op1;
+        sp1 <- write_ps_and_fresh p1;
         p2 <- load seg op2;
         set seg p2 op1;;
-        set seg p1 op2.
+        set seg sp1 op2.
 
   Definition conv_XADD (pre: prefix) (w: bool) (op1 op2: operand) : Conv unit :=
     conv_XCHG pre w op1 op2;;
@@ -2751,7 +2832,8 @@ Definition conv_POPF pre :=
                       | false, true => 4
                     end);
     df <- get_flag DF;
-    old_reg <- iload_op32 DS (Reg_op reg);
+    tmp <- iload_op32 DS (Reg_op reg);
+    old_reg <- write_ps_and_fresh tmp;
     new_reg1 <- arith add_op old_reg offset;
     new_reg2 <- arith sub_op old_reg offset;
     set_reg new_reg1 reg;;
@@ -3030,7 +3112,6 @@ Section X86FloatSemantics.
     i <- load_Z _ loc;
     v <- load_Z _ (enc_fpu_tag_mode tm);
     set_fpu_tag i v.
-
 
   (* increment the stack top; this is for popping the FPU stack grows downward *)
   Definition inc_stktop := 
@@ -3414,87 +3495,58 @@ Section X86FloatSemantics.
   Definition load_stktop : Conv (rtl_exp size80) :=
     topp <- get_stktop;
     get_fpu_reg topp.
-    
 
   Definition conv_FST (pre: prefix) (op: fp_operand) : Conv unit :=
     topp <- get_stktop;
-    v <- get_fpu_reg topp;
+    rv <- get_fpu_reg topp;
 
     underflow <- is_empty_tag topp;
 
     rm <- get_fpu_rctrl;
     let sr := get_segment pre DS in
 
+    (* Imprecision: in the no-underflow case, C1 should be set
+       if result was rounded up; cleared otherwise *)
+    v <- choose size1;
+    zero <- load_Z _ 0;
+    c1 <- if_exp underflow zero v;
+    set_fpu_flag F_C1 c1;;
+
+    undef_fpu_flag F_C0;;
+    undef_fpu_flag F_C2;;
+    undef_fpu_flag F_C3;;
+
     match op with
       | FPS_op i => (* Copy st(0) to st(i) *)
         fi <- freg_of_offset i;
-        set_fpu_reg fi v
+        set_fpu_reg fi rv
 
       | FPM16_op a => raise_error
 
       | FPM32_op a =>  (* Copy st(0) to 32-bit memory *)
         addr <- compute_addr a;
-        f32 <- float32_of_de_float v rm;
+        f32 <- float32_of_de_float rv rm;
         set_mem32 sr f32 addr
 
       | FPM64_op a =>  (* Copy st(0) to 64-bit memory *)
         addr <- compute_addr a;
-        f64 <- float64_of_de_float v rm;
+        f64 <- float64_of_de_float rv rm;
         set_mem64 sr f64 addr
 
       | FPM80_op a =>  (* Copy st(0) to 80-bit memory *)
         addr <- compute_addr a;
-        set_mem80 sr v addr
-    end;;
-
-    (* Imprecision: in the no-underflow case, C1 should be set
-       if result was rounded up; cleared otherwise *)
-    v <- choose size1;
-    zero <- load_Z _ 0;
-    c1 <- if_exp underflow zero v;
-    set_fpu_flag F_C1 c1;;
-
-    undef_fpu_flag F_C0;;
-    undef_fpu_flag F_C2;;
-    undef_fpu_flag F_C3.
-
-
-
-
-(* Suman *)
+        set_mem80 sr rv addr
+    end.
 
   Definition conv_FIST (pre: prefix) (op: fp_operand) : Conv unit :=
     topp <- get_stktop;
-    v <- get_fpu_reg topp;
+    rv <- get_fpu_reg topp;
 
     underflow <- is_empty_tag topp;
 
     rm <- get_fpu_rctrl;
     let sr := get_segment pre DS in
 
-    match op with
-      | FPS_op i => (* Copy st(0) to st(i) *)
-        fi <- freg_of_offset i;
-        set_fpu_reg fi v
-
-      | FPM16_op a => raise_error
-
-      | FPM32_op a =>  (* Copy st(0) to 32-bit memory *)
-      addr <- compute_addr a;
-      f32 <- float32_of_de_float v rm;
-      set_mem32 sr f32 addr
-
-      | FPM64_op a =>  (* Copy st(0) to 64-bit memory *)
-      addr <- compute_addr a;
-        f64 <- float64_of_de_float v rm;
-        set_mem64 sr f64 addr
-
-      | FPM80_op a =>  (* Copy st(0) to 80-bit memory *)
-        addr <- compute_addr a;
-	set_mem80 sr v addr
-
-    end;;
-
     (* Imprecision: in the no-underflow case, C1 should be set
        if result was rounded up; cleared otherwise *)
     v <- choose size1;
@@ -3504,13 +3556,30 @@ Section X86FloatSemantics.
 
     undef_fpu_flag F_C0;;
     undef_fpu_flag F_C2;;
-    undef_fpu_flag F_C3.
+    undef_fpu_flag F_C3;;
 
+    match op with
+      | FPS_op i => (* Copy st(0) to st(i) *)
+        fi <- freg_of_offset i;
+        set_fpu_reg fi rv
 
+      | FPM16_op a => raise_error
 
-(* Suman *)
+      | FPM32_op a =>  (* Copy st(0) to 32-bit memory *)
+      addr <- compute_addr a;
+      f32 <- float32_of_de_float rv rm;
+      set_mem32 sr f32 addr
 
+      | FPM64_op a =>  (* Copy st(0) to 64-bit memory *)
+      addr <- compute_addr a;
+        f64 <- float64_of_de_float rv rm;
+        set_mem64 sr f64 addr
 
+      | FPM80_op a =>  (* Copy st(0) to 80-bit memory *)
+        addr <- compute_addr a;
+	set_mem80 sr rv addr
+
+    end.
 
   (* stack pop and set tag *)
   Definition stk_pop_and_set_tag := 
@@ -3523,11 +3592,9 @@ Section X86FloatSemantics.
     conv_FST pre op;;
     stk_pop_and_set_tag.
 
-
   Definition conv_FISTP (pre: prefix) (op: fp_operand) :=
     conv_FIST pre op;;
     stk_pop_and_set_tag.
-
 
 
   (* gtan: the following constants are gotten by executing 
@@ -3606,14 +3673,6 @@ Section X86FloatSemantics.
 
     ires <- float32_of_de_float res rm;
 
-    match op with
-      | Imm_op _ => raise_error
-      | Reg_op r => set_reg ires r
-      | Address_op a => addr <- compute_addr a ; set_mem32 DS ires addr
-      | Offset_op off => addr <- load_int off;
-                                 set_mem32 DS ires addr
-    end;;
-
 
     (* Imprecision: in the no-underflow case, C1 should be set
        if result was rounded up; cleared otherwise *)
@@ -3624,8 +3683,15 @@ Section X86FloatSemantics.
 
     undef_fpu_flag F_C0;;
     undef_fpu_flag F_C2;;
-    undef_fpu_flag F_C3.
+    undef_fpu_flag F_C3;;
 
+    match op with
+      | Imm_op _ => raise_error
+      | Reg_op r => set_reg ires r
+      | Address_op a => addr <- compute_addr a ; set_mem32 DS ires addr
+      | Offset_op off => addr <- load_int off;
+                                 set_mem32 DS ires addr
+    end.
 
   Definition conv_farith (fop: float_arith_op) (noreverse: bool)
     (pre: prefix) (zerod: bool) (op: fp_operand) : Conv unit :=
@@ -3642,6 +3708,17 @@ Section X86FloatSemantics.
              | false, false => farith_de fop rm st0 opv
            end;
 
+    (* Imprecision: in the no-underflow case, C1 should be set
+       if result was rounded up; cleared otherwise *)
+    v <- choose size1;
+    zero <- load_Z _ 0;
+    c1 <- if_exp underflow zero v;
+    set_fpu_flag F_C1 c1;;
+
+    undef_fpu_flag F_C0;;
+    undef_fpu_flag F_C2;;
+    undef_fpu_flag F_C3;;
+
     match zerod, op with
       | true, FPS_op _ 
       | true, FPM32_op _ 
@@ -3653,19 +3730,7 @@ Section X86FloatSemantics.
         set_fpu_reg fi res
 
       | _, _ => raise_error
-    end;;
-
-
-    (* Imprecision: in the no-underflow case, C1 should be set
-       if result was rounded up; cleared otherwise *)
-    v <- choose size1;
-    zero <- load_Z _ 0;
-    c1 <- if_exp underflow zero v;
-    set_fpu_flag F_C1 c1;;
-
-    undef_fpu_flag F_C0;;
-    undef_fpu_flag F_C2;;
-    undef_fpu_flag F_C3.
+    end.
 
   (* ST(i) <- ST(i) fop ST(0) and pop the stack top *)
    Definition conv_farith_and_pop (fop: float_arith_op) (noreverse: bool) 
@@ -4198,3 +4263,7 @@ Notation "m1 ==> m2" := (step_immed m1 m2) (at level 55, m2 at next level).
 Require Import Relation_Operators.
 Definition steps := clos_refl_trans rtl_state step_immed.
 Notation "m1 '==>*' m2" := (steps m1 m2) (at level 55, m2 at next level).
+
+(* Definition no_prefix : prefix := mkPrefix None None false false. *)
+(* Compute (runConv (string_op_reg_shift EAX no_prefix false)). *)
+
